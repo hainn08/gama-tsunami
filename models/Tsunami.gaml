@@ -1,9 +1,11 @@
-model tsunami
+`model tsunami
 
 // Define the grid first, before global
+// CRITICAL: This grid represents the rasterized version of the GIS data
+// Similar to NetLogo's patches system
 grid cell_grid width: 100 height: 100 neighbors: 8 {
     bool is_land <- false;
-    bool is_road <- false;
+    bool is_road <- false;  // Match NetLogo's road? attribute - CRITICAL for movement constraint
     bool is_flooded <- false;
     int shelter_id <- -1;
     float distance_to_safezone <- float(100000.0);
@@ -46,13 +48,13 @@ global {
     
     // Population counts and sizes
     int locals_number <- 200;
-    float locals_size <- 4.0;
+    float locals_size <- 12.0;
     
     int tourists_number <- 100;
-    float tourists_size <- 4.0;
+    float tourists_size <- 12.0;
     
     int rescuers_number <- 20;
-    float rescuers_size <- 4.0;
+    float rescuers_size <- 12.0;
     
     // Status counts for each population
     int locals_safe <- 0;
@@ -180,9 +182,16 @@ global {
             }
         }
         
-        // Draw roads on top
+        // Mark cells as roads - CRITICAL: Match NetLogo logic
+        // This is equivalent to NetLogo's: if gis:intersects? roads self [set road? true]
         ask road {
             color <- road_color;
+            // Mark all cells that intersect with this road geometry
+            loop c over: cell_grid {
+                if (c.shape intersects self.shape) {
+                    c.is_road <- true;
+                }
+            }
         }
         
         // Draw buildings on top
@@ -542,9 +551,17 @@ species people skills: [moving] {
     float agent_size;
     
     bool is_valid_location(point new_loc) {
+        cell_grid target_cell <- cell_grid closest_to new_loc;
+        // Match NetLogo logic: can only move to cells that are:
+        // 1. Within valid area
+        // 2. On land (is_land = true)
+        // 3. On road (is_road = true) - CRITICAL addition
+        // 4. Not flooded
         return (valid_area covers new_loc) and 
-               (cell_grid closest_to new_loc).is_land and 
-               (shape intersects land_area);
+               (target_cell != nil) and
+               (target_cell.is_land) and 
+               (target_cell.is_road) and
+               (!target_cell.is_flooded);
     }
     
     // Death checking reflex - runs every step
@@ -626,8 +643,9 @@ species people skills: [moving] {
                     // Get next point in the path
                     point next_point <- first(path_to_target.vertices);
                     
-                    // Check if next point is on land before moving
-                    if ((cell_grid closest_to next_point).is_land) {
+                    // Match NetLogo: Check if next point is on land AND on road before moving
+                    cell_grid next_cell <- cell_grid closest_to next_point;
+                    if (next_cell != nil and next_cell.is_land and next_cell.is_road and !next_cell.is_flooded) {
                         do follow path: path_to_target speed: speed;
                     } else {
                         // Find a random land direction if path goes through ocean
@@ -640,8 +658,9 @@ species people skills: [moving] {
                             float random_angle <- rnd(360.0);
                             point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
                             
-                            // Check if the new point is on land
-                            if ((cell_grid closest_to possible_move).is_land) {
+                            // Match NetLogo: Check if the new point is on land AND on road
+                            cell_grid possible_cell <- cell_grid closest_to possible_move;
+                            if (possible_cell != nil and possible_cell.is_land and possible_cell.is_road and !possible_cell.is_flooded) {
                                 // Try to find a new path from this point
                                 location <- possible_move;
                                 found_valid_move <- true;
@@ -733,7 +752,8 @@ species people skills: [moving] {
                         cell_grid check_cell <- cell_grid closest_to check_point;
                         can_move_angle <- false;
                         
-                        if (check_cell != nil and check_cell.is_land and !check_cell.is_flooded) {
+                        // Match NetLogo: can-people-move-to-patch checks road? and flooded? and threshold
+                        if (check_cell != nil and check_cell.is_land and check_cell.is_road and !check_cell.is_flooded) {
                             // Check if people can move to this patch (equivalent to can-people-move-to-patch)
                             int people_count <- length(people overlapping check_cell);
                             if (people_count <= people_patch_threshold) {
@@ -771,10 +791,10 @@ species people skills: [moving] {
                         float target_y <- location.y + sin(best_angle) * speed;
                         point target <- {target_x, target_y};
                         
-                        // Validate target location
+                        // Match NetLogo: Validate target location is on road
                         if (valid_area covers target) {
                             cell_grid target_cell <- cell_grid closest_to target;
-                            if (target_cell.is_land and !target_cell.is_flooded) {
+                            if (target_cell != nil and target_cell.is_land and target_cell.is_road and !target_cell.is_flooded) {
                                 location <- target;
                             }
                         }
@@ -865,7 +885,8 @@ species people skills: [moving] {
                             
                             // Check if target location is valid (on land/road and not flooded)
                             cell_grid target_cell <- cell_grid closest_to potential_target;
-                            if (target_cell != nil and target_cell.is_land and !target_cell.is_flooded) {
+                            // Match NetLogo: can-people-move-to-patch checks road? and flooded?
+                            if (target_cell != nil and target_cell.is_land and target_cell.is_road and !target_cell.is_flooded) {
                                 target_location <- potential_target;
                                 found_valid_move <- true;
                             }
@@ -882,8 +903,9 @@ species people skills: [moving] {
                             float move_distance <- wandering_speed * 0.5; // Reduce distance for safety
                             point fallback_target <- location + {cos(random_angle) * move_distance, sin(random_angle) * move_distance};
                             
+                            // Match NetLogo: check road? for fallback movement
                             cell_grid fallback_cell <- cell_grid closest_to fallback_target;
-                            if (fallback_cell != nil and fallback_cell.is_land) {
+                            if (fallback_cell != nil and fallback_cell.is_land and fallback_cell.is_road and !fallback_cell.is_flooded) {
                                 location <- fallback_target;
                             }
                         }
@@ -935,7 +957,9 @@ species car skills: [moving] {
                 // Check if next point is on land (ocean avoidance)
                 point next_point <- first(path_to_target.vertices);
                 
-                if ((cell_grid closest_to next_point).is_land) {
+                // Match NetLogo: can-cars-move-to-patch checks road? and flooded?
+                cell_grid next_cell <- cell_grid closest_to next_point;
+                if (next_cell != nil and next_cell.is_land and next_cell.is_road and !next_cell.is_flooded) {
                     // Check for agents blocking the way
                     list<people> people_ahead <- people at_distance 5.0;
                     list<car> cars_ahead <- car at_distance 5.0;
@@ -961,7 +985,9 @@ species car skills: [moving] {
                         float random_angle <- rnd(360.0);
                         point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
                         
-                        if ((cell_grid closest_to possible_move).is_land) {
+                        // Match NetLogo: cars need road? = true to move
+                        cell_grid possible_cell <- cell_grid closest_to possible_move;
+                        if (possible_cell != nil and possible_cell.is_land and possible_cell.is_road and !possible_cell.is_flooded) {
                             location <- possible_move;
                             found_valid_move <- true;
                         }
@@ -984,7 +1010,9 @@ species car skills: [moving] {
                 // Check if next point is on land
                 point next_point <- first(path_to_target.vertices);
                 
-                if ((cell_grid closest_to next_point).is_land) {
+                // Match NetLogo: can-cars-move-to-patch checks road? and flooded?
+                cell_grid next_cell <- cell_grid closest_to next_point;
+                if (next_cell != nil and next_cell.is_land and next_cell.is_road and !next_cell.is_flooded) {
                     // Check for people or cars ahead
                     list<people> people_ahead <- people at_distance 5.0;
                     list<car> cars_ahead <- car at_distance 5.0;
@@ -1023,7 +1051,9 @@ species car skills: [moving] {
                         float random_angle <- rnd(360.0);
                         point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
                         
-                        if ((cell_grid closest_to possible_move).is_land) {
+                        // Match NetLogo: cars need road? = true to move
+                        cell_grid possible_cell <- cell_grid closest_to possible_move;
+                        if (possible_cell != nil and possible_cell.is_land and possible_cell.is_road and !possible_cell.is_flooded) {
                             location <- possible_move;
                             found_valid_move <- true;
                         }
