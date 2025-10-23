@@ -1,4 +1,4 @@
-`model tsunami
+model tsunami
 
 // Define the grid first, before global
 // CRITICAL: This grid represents the rasterized version of the GIS data
@@ -32,6 +32,14 @@ global {
     geometry land_area;
     geometry valid_area;
     
+    // OPTIMIZATION: Add road network graph for proper navigation
+    graph road_network;
+    graph simplified_road_network;
+    
+    // Road network connectivity parameters
+    float road_connection_tolerance <- 10.0 parameter: "Road connection tolerance (m)" category: "Network";
+    int min_component_size <- 10 parameter: "Minimum component size" category: "Network";
+    
     // Lists for shelter management
     list<point> shelter_locations;
     list<float> shelter_capacities;
@@ -48,13 +56,13 @@ global {
     
     // Population counts and sizes
     int locals_number <- 200;
-    float locals_size <- 12.0;
+    float locals_size <- 5.0;
     
     int tourists_number <- 100;
-    float tourists_size <- 12.0;
+    float tourists_size <- 5.0;
     
     int rescuers_number <- 20;
-    float rescuers_size <- 12.0;
+    float rescuers_size <- 5.0;
     
     // Status counts for each population
     int locals_safe <- 0;
@@ -124,9 +132,12 @@ global {
     
     // Car initialization
     action init_cars {
-        create car number: cars_number {
-            location <- any_location_in(one_of(road));
-            cars_in_danger <- cars_in_danger + 1;
+        loop i from: 0 to: cars_number - 1 {
+            create car {
+                // Place randomly on a road segment
+                location <- any_location_in(one_of(road));
+                cars_in_danger <- cars_in_danger + 1;
+            }
         }
     }
     
@@ -166,6 +177,78 @@ global {
             shape <- shape; 
         }
         create road from: road_shapefile;
+        
+        // OPTIMIZATION: Create road network graph
+        write "Building road network...";
+        
+        // First simplify roads to reduce vertices (helps with connectivity)
+        ask road {
+            shape <- simplification(shape, road_connection_tolerance);
+        }
+        
+        road_network <- as_edge_graph(road);
+        
+        // Create simplified version with weights based on road length
+        map<road, float> road_weights <- road as_map (each::each.shape.perimeter);
+        simplified_road_network <- as_edge_graph(road) with_weights road_weights;
+        
+        // IMPORTANT: Check graph connectivity
+        write "Total roads: " + length(road);
+        write "Graph vertices: " + length(simplified_road_network.vertices);
+        write "Graph edges: " + length(simplified_road_network.edges);
+        
+        // Get connected components
+        list<list> components <- connected_components_of(simplified_road_network);
+        write "Number of disconnected road components: " + length(components);
+        
+        // Show component sizes
+        list<int> component_sizes <- components collect length(each);
+        component_sizes <- reverse(component_sizes sort_by each);
+        loop i from: 0 to: min([length(component_sizes) - 1, 9]) {
+            write "  Component " + i + " size: " + component_sizes[i] + " nodes";
+        }
+        
+        if (length(components) > 1) {
+            // IMPROVED: Use all components with at least min_component_size nodes
+            list<list> major_components <- components where (length(each) >= min_component_size);
+            
+            if (length(major_components) > 0) {
+                write "Using " + length(major_components) + " major components (size >= " + min_component_size + " nodes)";
+                
+                // Merge all major components
+                list<point> all_major_nodes <- [];
+                loop comp over: major_components {
+                    all_major_nodes <- all_major_nodes + comp;
+                }
+                write "Total nodes in major components: " + length(all_major_nodes);
+                
+                // Filter roads to only those in major components
+                list<road> connected_roads <- [];
+                ask road {
+                    bool in_component <- false;
+                    loop pt over: shape.points {
+                        if (all_major_nodes contains pt) {
+                            in_component <- true;
+                            break;
+                        }
+                    }
+                    if (in_component) {
+                        connected_roads << self;
+                    }
+                }
+                
+                // Rebuild graph with connected roads
+                if (!empty(connected_roads)) {
+                    write "Rebuilding graph with " + length(connected_roads) + " connected roads";
+                    road_network <- as_edge_graph(connected_roads);
+                    map<road, float> connected_weights <- connected_roads as_map (each::each.shape.perimeter);
+                    simplified_road_network <- as_edge_graph(connected_roads) with_weights connected_weights;
+                    write "New graph has " + length(simplified_road_network.vertices) + " vertices";
+                }
+            } else {
+                write "WARNING: No large components found, using all roads";
+            }
+        }
         
         // Define land area (union of buildings and roads)
         land_area <- union(building collect each.shape, road collect each.shape);
@@ -213,42 +296,52 @@ global {
         }
         
         // Create initial populations
-        create people number: locals_number {
-            type <- "local";
-            color <- #yellow;
-            agent_size <- locals_size;
-            speed <- rnd(human_speed_min, human_speed_max);
-            is_safe <- false;
-            is_dead <- false;
-            location <- any_location_in(one_of(road));
-        }
-        locals_in_danger <- locals_number; // Initialize counter
+        // Place agents INSIDE roads (not just at vertices) for better connectivity
+        list<road> all_roads <- list(road);
         
-        create people number: tourists_number {
-            type <- "tourist";
-            color <- #violet;
-            agent_size <- tourists_size;
-            speed <- rnd(human_speed_min, human_speed_max);
-            is_safe <- false;
-            is_dead <- false;
-            radius_look <- 15.0 + rnd(-2.0, 2.0);
-            leader <- nil;
-            location <- any_location_in(one_of(road));
+        loop i from: 0 to: locals_number - 1 {
+            create people {
+                type <- "local";
+                color <- #yellow;
+                agent_size <- locals_size;
+                speed <- rnd(human_speed_min, human_speed_max);
+                is_safe <- false;
+                is_dead <- false;
+                // Place randomly on a road segment
+                location <- any_location_in(one_of(all_roads));
+            }
         }
-        tourists_in_danger <- tourists_number; // Initialize counter
+        locals_in_danger <- locals_number;
         
-        create people number: rescuers_number {
-            type <- "rescuer";
-            color <- #turquoise;
-            agent_size <- rescuers_size;
-            speed <- rnd(human_speed_min, human_speed_max);
-            is_safe <- false;
-            is_dead <- false;
-            radius_look <- 15.0 + rnd(-2.0, 2.0);
-            nb_tourists_to_rescue <- 0;
-            location <- any_location_in(one_of(road));
+        loop i from: 0 to: tourists_number - 1 {
+            create people {
+                type <- "tourist";
+                color <- #violet;
+                agent_size <- tourists_size;
+                speed <- rnd(human_speed_min, human_speed_max);
+                is_safe <- false;
+                is_dead <- false;
+                radius_look <- 15.0 + rnd(-2.0, 2.0);
+                leader <- nil;
+                location <- any_location_in(one_of(all_roads));
+            }
         }
-        rescuers_in_danger <- rescuers_number; // Initialize counter
+        tourists_in_danger <- tourists_number;
+        
+        loop i from: 0 to: rescuers_number - 1 {
+            create people {
+                type <- "rescuer";
+                color <- #turquoise;
+                agent_size <- rescuers_size;
+                speed <- rnd(human_speed_min, human_speed_max);
+                is_safe <- false;
+                is_dead <- false;
+                radius_look <- 15.0 + rnd(-2.0, 2.0);
+                nb_tourists_to_rescue <- 0;
+                location <- any_location_in(one_of(all_roads));
+            }
+        }
+        rescuers_in_danger <- rescuers_number;
         
         // Initialize tsunami segments like NetLogo
         tsunami_length_segment <- world.shape.height / tsunami_nb_segments;
@@ -635,44 +728,15 @@ species people skills: [moving] {
                 if (speed < human_speed_min) { speed <- human_speed_min; }
                 if (speed > human_speed_max) { speed <- human_speed_max; }
                 
+                // OPTIMIZED: Use road network graph for proper pathfinding
                 point target <- (shelter closest_to self).location;
-                path path_to_target <- topology(road) path_between (self.location, target);
+                path path_to_target <- path_between(simplified_road_network, location, target);
                 
-                // Check if path exists and doesn't cross ocean
-                if (path_to_target != nil) {
-                    // Get next point in the path
-                    point next_point <- first(path_to_target.vertices);
-                    
-                    // Match NetLogo: Check if next point is on land AND on road before moving
-                    cell_grid next_cell <- cell_grid closest_to next_point;
-                    if (next_cell != nil and next_cell.is_land and next_cell.is_road and !next_cell.is_flooded) {
-                        do follow path: path_to_target speed: speed;
-                    } else {
-                        // Find a random land direction if path goes through ocean
-                        bool found_valid_move <- false;
-                        int safety_counter <- 0;
-                        int max_safety <- 100; // Safety measure to prevent CPU hogging
-                        
-                        loop while: (not found_valid_move) {
-                            // Try a random direction
-                            float random_angle <- rnd(360.0);
-                            point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
-                            
-                            // Match NetLogo: Check if the new point is on land AND on road
-                            cell_grid possible_cell <- cell_grid closest_to possible_move;
-                            if (possible_cell != nil and possible_cell.is_land and possible_cell.is_road and !possible_cell.is_flooded) {
-                                // Try to find a new path from this point
-                                location <- possible_move;
-                                found_valid_move <- true;
-                            }
-                            
-                            // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                            safety_counter <- safety_counter + 1;
-                            if (safety_counter >= max_safety) {
-                                break; // Exit this loop but the agent will try again next cycle
-                            }
-                        }
-                    }
+                if (path_to_target != nil and !empty(path_to_target.edges)) {
+                    do follow path: path_to_target speed: speed;
+                } else {
+                    // If no path via graph, move toward target along roads
+                    do goto target: target on: simplified_road_network speed: speed;
                 }
             }
             match "tourist" {
@@ -683,30 +747,20 @@ species people skills: [moving] {
                 if (speed > human_speed_max) { speed <- human_speed_max; }
                 
                 if (tourist_strategy = "wandering") {
-                    // Wandering strategy: tourists move randomly
-                    // Try to find a valid location with safety counter to prevent infinite loops
-                    bool found_valid_location <- false;
-                    int safety_counter <- 0;
-                    int max_safety <- 100; // Safety measure to prevent CPU hogging
-                    
-                    loop while: (not found_valid_location) {
-                        // Generate a random possible location
-                        point possible_loc <- self.location + {rnd(-5,5) * speed, rnd(-5,5) * speed};
-                        
-                        // Check if location is valid (on land and within bounds)
-                        if (is_valid_location(possible_loc)) {
-                            location <- possible_loc;
-                            found_valid_location <- true;
-                        }
-                        
-                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                        safety_counter <- safety_counter + 1;
-                        if (safety_counter >= max_safety) {
-                            break; // Exit this loop but the agent will try again next cycle
+                    // FIXED: Wandering strategy using road network (like locals)
+                    // Pick random nearby node on road network
+                    list<point> nearby_nodes <- simplified_road_network.vertices where (each distance_to self < 30.0 and each distance_to self > 1.0);
+                    if (!empty(nearby_nodes)) {
+                        point random_target <- one_of(nearby_nodes);
+                        path path_to_wander <- path_between(simplified_road_network, location, random_target);
+                        if (path_to_wander != nil and !empty(path_to_wander.edges)) {
+                            do follow path: path_to_wander speed: speed;
+                        } else {
+                            do goto target: random_target on: simplified_road_network speed: speed;
                         }
                     }
                 } else if (tourist_strategy = "following rescuers or locals") {
-                    // Following strategy: tourists follow rescuers or locals
+                    // OPTIMIZED: Following strategy using road network graph
                     if (leader = nil) {
                         // Try to find a rescuer first (priority)
                         list<people> potential_leaders <- (people where (each.type = "rescuer")) at_distance radius_look;
@@ -719,85 +773,58 @@ species people skills: [moving] {
                         }
                     }
                     if (leader != nil) {
-                        // Follow the leader using road network if possible
-                        path path_to_leader <- topology(road) path_between (self.location, leader.location);
-                        if (path_to_leader != nil) {
+                        // Follow leader using road network
+                        path path_to_leader <- path_between(simplified_road_network, location, leader.location);
+                        if (path_to_leader != nil and !empty(path_to_leader.edges)) {
                             do follow path: path_to_leader speed: speed;
+                        } else {
+                            do goto target: leader.location on: simplified_road_network speed: speed;
                         }
                     } else {
-                        // No leader found, perform small random movement
-                        point possible_loc <- self.location + {rnd(-1,1) * speed, rnd(-1,1) * speed};
-                        if (is_valid_location(possible_loc)) {
-                            location <- possible_loc;
+                        // No leader - go to shelter
+                        point target <- (shelter closest_to self).location;
+                        path path_to_target <- path_between(simplified_road_network, location, target);
+                        if (path_to_target != nil and !empty(path_to_target.edges)) {
+                            do follow path: path_to_target speed: speed * 0.5;
+                        } else {
+                            do goto target: target on: simplified_road_network speed: speed * 0.5;
                         }
                     }
                 } else if (tourist_strategy = "following crowd") {
-                    // Crowd following strategy: Move toward densest population areas
-                    // Implementation follows exact NetLogo algorithm 
-                    float centroid_distance <- radius_look / 2.0;
+                    // FIXED: Crowd following using road network
+                    // Find the densest crowd location within radius
                     float centroid_radius <- radius_look / 2.0;
-                    float angle_look <- 0.0;
-                    int max_nb_crowd <- -1;
-                    float best_angle <- -1.0;
-                    bool can_move_angle <- false;
+                    point best_crowd_location <- nil;
+                    int max_crowd_size <- 0;
                     
-                    // Check all 8 directions (45-degree increments like NetLogo)
-                    loop while: (angle_look < 360) {
-                        // Step 1: Check if can move 1 step in this direction
-                        float check_x <- location.x + cos(angle_look) * 1.0;
-                        float check_y <- location.y + sin(angle_look) * 1.0;
-                        point check_point <- {check_x, check_y};
+                    // Sample nearby road network nodes
+                    list<point> nearby_nodes <- simplified_road_network.vertices where (each distance_to self < radius_look);
+                    
+                    loop node over: nearby_nodes {
+                        // Count people near this node
+                        list<people> crowd_near_node <- people where (
+                            (each.type = "tourist" or each.type = "local") and 
+                            (each distance_to node <= centroid_radius)
+                        );
                         
-                        // Find the cell at this check point
-                        cell_grid check_cell <- cell_grid closest_to check_point;
-                        can_move_angle <- false;
-                        
-                        // Match NetLogo: can-people-move-to-patch checks road? and flooded? and threshold
-                        if (check_cell != nil and check_cell.is_land and check_cell.is_road and !check_cell.is_flooded) {
-                            // Check if people can move to this patch (equivalent to can-people-move-to-patch)
-                            int people_count <- length(people overlapping check_cell);
-                            if (people_count <= people_patch_threshold) {
-                                can_move_angle <- true;
-                            }
+                        if (length(crowd_near_node) > max_crowd_size) {
+                            max_crowd_size <- length(crowd_near_node);
+                            best_crowd_location <- node;
                         }
-                        
-                        // Step 2: If can move, check crowd density at centroid
-                        if (can_move_angle) {
-                            float centroid_x <- location.x + cos(angle_look) * centroid_distance;
-                            float centroid_y <- location.y + sin(angle_look) * centroid_distance;
-                            point centroid_point <- {centroid_x, centroid_y};
-                            
-                            // Count tourists and locals in radius around this centroid point
-                            list<people> crowd_people <- people where (
-                                (each.type = "tourist" or each.type = "local") and 
-                                (each distance_to centroid_point <= centroid_radius)
-                            );
-                            int nb_crowd <- length(crowd_people);
-                            
-                            // Step 3: Update best direction
-                            if (nb_crowd > max_nb_crowd) {
-                                max_nb_crowd <- nb_crowd;
-                                best_angle <- angle_look;
-                            }
-                        }
-                        
-                        // Increment angle by 45 degrees like NetLogo
-                        angle_look <- angle_look + 45.0;
                     }
                     
-                    // Step 4: Move towards best direction if found
-                    if (best_angle >= 0) {
-                        float target_x <- location.x + cos(best_angle) * speed;
-                        float target_y <- location.y + sin(best_angle) * speed;
-                        point target <- {target_x, target_y};
-                        
-                        // Match NetLogo: Validate target location is on road
-                        if (valid_area covers target) {
-                            cell_grid target_cell <- cell_grid closest_to target;
-                            if (target_cell != nil and target_cell.is_land and target_cell.is_road and !target_cell.is_flooded) {
-                                location <- target;
-                            }
+                    // Move toward densest crowd location using road network
+                    if (best_crowd_location != nil) {
+                        path path_to_crowd <- path_between(simplified_road_network, location, best_crowd_location);
+                        if (path_to_crowd != nil and !empty(path_to_crowd.edges)) {
+                            do follow path: path_to_crowd speed: speed;
+                        } else {
+                            do goto target: best_crowd_location on: simplified_road_network speed: speed;
                         }
+                    } else {
+                        // No crowd found, move to shelter
+                        point target <- (shelter closest_to self).location;
+                        do goto target: target on: simplified_road_network speed: speed * 0.5;
                     }
                 }
             }
@@ -829,84 +856,42 @@ species people skills: [moving] {
                 
                 // EMERGENCY EVACUATION: If tsunami is too close (<150m) or immediate danger, evacuate
                 if (immediate_danger or min_tsunami_distance < 150.0) {
-                    // Force evacuation to nearest shelter with increased speed
+                    // OPTIMIZED: Force evacuation using road network
                     point target <- (shelter closest_to self).location;
-                    path path_to_target <- topology(road) path_between (self.location, target);
-                    
-                    if (path_to_target != nil and !empty(path_to_target.vertices)) {
-                        // Emergency evacuation with 50% speed boost
+                    path path_to_target <- path_between(simplified_road_network, location, target);
+                    if (path_to_target != nil and !empty(path_to_target.edges)) {
                         do follow path: path_to_target speed: (speed * 1.5);
                     } else {
-                        // Direct movement if no path available
-                        do goto target: target speed: (speed * 1.5);
+                        do goto target: target on: simplified_road_network speed: (speed * 1.5);
                     }
                 } else {
                     // NORMAL RESCUE OPERATIONS: Continue rescue mission when safe distance
                     
-                    // Find nearby tourists within radius_look (matching NetLogo: count tourists in-radius radius_look)
+                    // Find nearby tourists within radius_look
                     list<people> nearby_tourists <- (people where (each.type = "tourist" and !each.is_safe and !each.is_dead)) at_distance radius_look;
                     
                     if (!empty(nearby_tourists)) {
-                        // STRATEGY 1: Lead tourists to shelter when found
-                        // This matches NetLogo logic: when nb_tourists > 0, rescuer leads tourists to safety
+                        // Lead tourists to shelter
                         point target <- (shelter closest_to self).location;
-                        path path_to_target <- topology(road) path_between (self.location, target);
-                        
-                        if (path_to_target != nil and !empty(path_to_target.vertices)) {
-                            // Follow path with normal speed when guiding tourists
+                        path path_to_target <- path_between(simplified_road_network, location, target);
+                        if (path_to_target != nil and !empty(path_to_target.edges)) {
                             do follow path: path_to_target speed: speed;
                         } else {
-                            // Fallback: direct movement if no path found
-                            do goto target: target speed: speed;
+                            do goto target: target on: simplified_road_network speed: speed;
                         }
-                        
-                        // Keep normal speed when guiding tourists (no speed boost needed for safety)
-                        // Speed remains as randomized: gauss(speed, 1.0) like NetLogo
-                        
                     } else {
-                        // STRATEGY 2: Wandering search pattern for tourists
-                        // SPEED BOOST: Increase speed by 20% when searching (matches NetLogo: 1.2 * speed)
+                        // STRATEGY 2: Wander on road network searching for tourists
                         float wandering_speed <- gauss(speed * 1.2, 1.0);
-                        
-                        // Ensure speed stays within defined limits
                         if (wandering_speed < human_speed_min) { wandering_speed <- human_speed_min; }
                         if (wandering_speed > human_speed_max) { wandering_speed <- human_speed_max; }
                         
-                        // 8-direction search pattern (matches NetLogo's 45° increments)
-                        float angle_look <- 0.0;
-                        bool found_valid_move <- false;
-                        point target_location <- location;
-                        
-                        // Search in 8 directions (0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
-                        loop while: (angle_look < 360 and !found_valid_move) {
-                            float target_x <- location.x + cos(angle_look) * wandering_speed;
-                            float target_y <- location.y + sin(angle_look) * wandering_speed;
-                            point potential_target <- {target_x, target_y};
-                            
-                            // Check if target location is valid (on land/road and not flooded)
-                            cell_grid target_cell <- cell_grid closest_to potential_target;
-                            // Match NetLogo: can-people-move-to-patch checks road? and flooded?
-                            if (target_cell != nil and target_cell.is_land and target_cell.is_road and !target_cell.is_flooded) {
-                                target_location <- potential_target;
-                                found_valid_move <- true;
-                            }
-                            
-                            angle_look <- angle_look + 45.0; // 45° increments like NetLogo
-                        }
-                        
-                        // Move to the found location with boosted wandering speed
-                        if (found_valid_move) {
-                            location <- target_location;
-                        } else {
-                            // Fallback: random movement if no valid direction found in 8-direction search
-                            float random_angle <- rnd(360.0);
-                            float move_distance <- wandering_speed * 0.5; // Reduce distance for safety
-                            point fallback_target <- location + {cos(random_angle) * move_distance, sin(random_angle) * move_distance};
-                            
-                            // Match NetLogo: check road? for fallback movement
-                            cell_grid fallback_cell <- cell_grid closest_to fallback_target;
-                            if (fallback_cell != nil and fallback_cell.is_land and fallback_cell.is_road and !fallback_cell.is_flooded) {
-                                location <- fallback_target;
+                        // Pick a random nearby node to move toward
+                        list<point> nearby_nodes <- simplified_road_network.vertices where (each distance_to self < 50.0);
+                        if (!empty(nearby_nodes)) {
+                            point random_target <- one_of(nearby_nodes);
+                            path path_to_wander <- path_between(simplified_road_network, location, random_target);
+                            if (path_to_wander != nil and !empty(path_to_wander.edges)) {
+                                do follow path: path_to_wander speed: wandering_speed;
                             }
                         }
                     }
@@ -951,118 +936,74 @@ species car skills: [moving] {
         // Strategy 1: Always go ahead
         if (car_strategy = "always go ahead") {
             shelter target_shelter <- shuffle(shelter) with_min_of (each distance_to self);
-            path path_to_target <- topology(road) path_between (self.location, target_shelter.location);
             
-            if (path_to_target != nil and !empty(path_to_target.vertices)) {
-                // Check if next point is on land (ocean avoidance)
-                point next_point <- first(path_to_target.vertices);
-                
-                // Match NetLogo: can-cars-move-to-patch checks road? and flooded?
-                cell_grid next_cell <- cell_grid closest_to next_point;
-                if (next_cell != nil and next_cell.is_land and next_cell.is_road and !next_cell.is_flooded) {
-                    // Check for agents blocking the way
-                    list<people> people_ahead <- people at_distance 5.0;
-                    list<car> cars_ahead <- car at_distance 5.0;
-                    
-                    if (!empty(people_ahead) or !empty(cars_ahead)) {
-                        // Path is blocked, wait in place
-                        // Could add a waiting animation or state indicator here
-                    } else {
-                        // Path is clear, adjust speed and move
-                        // Speed up if no car ahead
-                        speed <- speed + car_acceleration;
-                        // Clamp speed
-                        speed <- min([max([speed, car_speed_min]), car_speed_max]);
-                        do follow path: path_to_target speed: speed;
-                    }
+            // Check for obstacles
+            list<people> people_ahead <- people at_distance 5.0;
+            list<car> cars_ahead <- car at_distance 5.0;
+            
+            if (!empty(people_ahead) or !empty(cars_ahead)) {
+                // Path is blocked, decelerate
+                speed <- max([speed - car_deceleration, car_speed_min]);
+            } else {
+                // Path is clear, accelerate and move
+                speed <- min([speed + car_acceleration, car_speed_max]);
+                path path_to_target <- path_between(simplified_road_network, location, target_shelter.location);
+                if (path_to_target != nil and !empty(path_to_target.edges)) {
+                    do follow path: path_to_target speed: speed;
                 } else {
-                    // Next point is in ocean, find random land movement
-                    int safety_counter <- 0;
-                    int max_safety <- 100; // Safety measure to prevent CPU hogging
-                    bool found_valid_move <- false;
-                    
-                    loop while: (not found_valid_move) {
-                        float random_angle <- rnd(360.0);
-                        point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
-                        
-                        // Match NetLogo: cars need road? = true to move
-                        cell_grid possible_cell <- cell_grid closest_to possible_move;
-                        if (possible_cell != nil and possible_cell.is_land and possible_cell.is_road and !possible_cell.is_flooded) {
-                            location <- possible_move;
-                            found_valid_move <- true;
-                        }
-                        
-                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                        safety_counter <- safety_counter + 1;
-                        if (safety_counter >= max_safety) {
-                            break; // Exit this loop but the agent will try again next cycle
-                        }
-                    }
+                    do goto target: target_shelter.location on: simplified_road_network speed: speed;
                 }
             }
         }
         // Strategy: Go out when congestion
         else if (car_strategy = "go out when congestion") {
             shelter target_shelter <- shuffle(shelter) with_min_of (each distance_to self);
-            path path_to_target <- topology(road) path_between (self.location, target_shelter.location);
+            road current_road <- road closest_to self;
             
-            if (path_to_target != nil and !empty(path_to_target.vertices)) {
-                // Check if next point is on land
-                point next_point <- first(path_to_target.vertices);
+            // Check if current road is flooded
+            if (current_road != nil and current_road.is_flooded) {
+                // Create people from car occupants
+                create people number: nb_people_in {
+                    type <- "local";
+                    location <- myself.location;
+                    color <- #yellow;
+                    is_dead <- false;
+                    is_safe <- false;
+                    speed <- rnd(human_speed_min, human_speed_max);
+                }
+                cars_in_danger <- cars_in_danger - 1;
+                do die;
+            } else {
+                // Check for congestion
+                list<people> people_ahead <- people at_distance 5.0;
+                list<car> cars_ahead <- car at_distance 5.0;
                 
-                // Match NetLogo: can-cars-move-to-patch checks road? and flooded?
-                cell_grid next_cell <- cell_grid closest_to next_point;
-                if (next_cell != nil and next_cell.is_land and next_cell.is_road and !next_cell.is_flooded) {
-                    // Check for people or cars ahead
-                    list<people> people_ahead <- people at_distance 5.0;
-                    list<car> cars_ahead <- car at_distance 5.0;
+                if (!empty(people_ahead) or !empty(cars_ahead)) {
+                    cars_time_wait <- cars_time_wait + 1;
+                    speed <- max([speed - car_deceleration, car_speed_min]);
                     
-                    if (!empty(people_ahead) or !empty(cars_ahead)) {
-                        // There are agents blocking the way
-                        cars_time_wait <- cars_time_wait + 1;
-                        
-                        if (cars_time_wait >= cars_threshold_wait) {
-                            // Create people from car occupants
-                            create people number: nb_people_in {
-                                type <- "local";
-                                location <- myself.location;
-                                color <- #yellow;
-                                is_dead <- false;
-                                is_safe <- false;
-                                speed <- rnd(human_speed_min, human_speed_max);
-                            }
-                            cars_in_danger <- cars_in_danger - 1;
-                            do die;
+                    if (cars_time_wait >= cars_threshold_wait) {
+                        // Create people from car occupants
+                        create people number: nb_people_in {
+                            type <- "local";
+                            location <- myself.location;
+                            color <- #yellow;
+                            is_dead <- false;
+                            is_safe <- false;
+                            speed <- rnd(human_speed_min, human_speed_max);
                         }
-                    } else {
-                        // Path is clear
-                        cars_time_wait <- 0;
-                        speed <- speed + car_acceleration;
-                        speed <- min([max([speed, car_speed_min]), car_speed_max]);
-                        do follow path: path_to_target speed: speed;
+                        cars_in_danger <- cars_in_danger - 1;
+                        do die;
                     }
                 } else {
-                    // Next point is in ocean, use random land movement
-                    int safety_counter <- 0;
-                    int max_safety <- 100; // Safety measure to prevent CPU hogging
-                    bool found_valid_move <- false;
-                    
-                    loop while: (not found_valid_move) {
-                        float random_angle <- rnd(360.0);
-                        point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
-                        
-                        // Match NetLogo: cars need road? = true to move
-                        cell_grid possible_cell <- cell_grid closest_to possible_move;
-                        if (possible_cell != nil and possible_cell.is_land and possible_cell.is_road and !possible_cell.is_flooded) {
-                            location <- possible_move;
-                            found_valid_move <- true;
-                        }
-                        
-                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                        safety_counter <- safety_counter + 1;
-                        if (safety_counter >= max_safety) {
-                            break; // Exit this loop but the agent will try again next cycle
-                        }
+                    // Path is clear
+                    cars_time_wait <- 0;
+                    speed <- min([speed + car_acceleration, car_speed_max]);
+                    path path_to_target <- path_between(simplified_road_network, location, target_shelter.location);
+                    if (path_to_target != nil and !empty(path_to_target.edges)) {
+                        do follow path: path_to_target speed: speed;
+                    } else {
+                        do goto target: target_shelter.location on: simplified_road_network speed: speed;
                     }
                 }
             }
