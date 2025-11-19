@@ -48,6 +48,11 @@ global {
     float road_connection_tolerance <- 10.0 parameter: "Road connection tolerance (m)" category: "Network";
     int min_component_size <- 10 parameter: "Minimum component size" category: "Network";
     
+    // Visualization: Store vertices after clean_network for display
+    list<point> network_vertices <- [];
+    bool show_network_vertices <- false parameter: "Show Network Vertices" category: "Visualization";
+    float vertex_display_size <- 6.0 parameter: "Vertex Display Size" category: "Visualization" min: 1.0 max: 20.0;
+    
     // OPTIMIZATION: Spatial indexing for fast neighbor lookups - OPTIMIZED for 5000 agents
     map<cell_grid, list<people>> people_spatial_index;
     map<cell_grid, list<car>> car_spatial_index;
@@ -252,6 +257,8 @@ global {
             road_network <- as_edge_graph(road);
             map<road, float> road_weights <- road as_map (each::each.shape.perimeter);
             simplified_road_network <- as_edge_graph(road) with_weights road_weights;
+            // Store vertices for visualization even in fallback case
+            network_vertices <- road_network.vertices;
         } else {
             // Replace old roads with cleaned roads
             write "Replacing roads with cleaned geometries...";
@@ -270,42 +277,39 @@ global {
                 write "WARNING: Road count very high (" + length(road) + "), may impact performance";
             }
             
-            // Create graph using as_edge_graph (simpler than as_driving_graph)
-            road_network <- as_edge_graph(road);
-            map<road, float> road_weights <- road as_map (each::each.shape.perimeter);
-            simplified_road_network <- as_edge_graph(road) with_weights road_weights;
+            // OPTIMIZATION: Create temporary graph only for component analysis (no weights for speed)
+            // This avoids creating the full graph twice (Linus optimization)
+            write "Analyzing network connectivity...";
+            graph temp_graph <- as_edge_graph(road);
+            write "Temporary graph created with " + length(temp_graph.vertices) + " vertices and " + 
+                 length(temp_graph.edges) + " edges";
             
-            write "Graph created with " + length(road_network.vertices) + " vertices and " + 
-                 length(road_network.edges) + " edges";
-        }
-        
-        // IMPORTANT: Check graph connectivity
-        write "Total roads: " + length(road);
-        write "Graph vertices: " + length(simplified_road_network.vertices);
-        write "Graph edges: " + length(simplified_road_network.edges);
-        
-        // Get connected components
-        list<list> components <- connected_components_of(simplified_road_network);
-        write "Number of disconnected road components: " + length(components);
-        
-        // Show component sizes (only if components exist)
-        if (length(components) > 0) {
-            list<int> component_sizes <- components collect length(each);
-            component_sizes <- reverse(component_sizes sort_by each);
-            int max_components_to_show <- min([length(component_sizes), 10]);
-            loop i from: 0 to: max_components_to_show - 1 {
-                write "  Component " + i + " size: " + component_sizes[i] + " nodes";
+            // Store vertices for visualization
+            network_vertices <- temp_graph.vertices;
+            
+            // Get connected components from temporary graph
+            list<list> components <- connected_components_of(temp_graph);
+            write "Number of disconnected road components: " + length(components);
+            
+            // Show component sizes (only if components exist)
+            if (length(components) > 0) {
+                list<int> component_sizes <- components collect length(each);
+                component_sizes <- reverse(component_sizes sort_by each);
+                int max_components_to_show <- min([length(component_sizes), 10]);
+                loop i from: 0 to: max_components_to_show - 1 {
+                    write "  Component " + i + " size: " + component_sizes[i] + " nodes";
+                }
+            } else {
+                write "  WARNING: No components found in graph";
             }
-        } else {
-            write "  WARNING: No components found in graph";
-        }
-        
-        if (length(components) > 1) {
-            // IMPROVED: Use all components with at least min_component_size nodes
+            
+            // OPTIMIZATION: Always filter components by min_component_size (not just when > 1)
+            // This ensures we filter even if there's only 1 large component with small sub-components
             list<list> major_components <- components where (length(each) >= min_component_size);
             
             if (length(major_components) > 0) {
-                write "Using " + length(major_components) + " major components (size >= " + min_component_size + " nodes)";
+                write "Filtering: Using " + length(major_components) + " major components (size >= " + min_component_size + " nodes)";
+                write "  Removed " + (length(components) - length(major_components)) + " small components";
                 
                 // Merge all major components
                 list<point> all_major_nodes <- [];
@@ -329,18 +333,34 @@ global {
                     }
                 }
                 
-                // Rebuild graph with connected roads
+                // OPTIMIZATION: Create final graph only once after filtering (Linus optimization)
                 if (!empty(connected_roads)) {
-                    write "Rebuilding graph with " + length(connected_roads) + " connected roads";
+                    write "Creating final graph with " + length(connected_roads) + " connected roads";
                     road_network <- as_edge_graph(connected_roads);
-                    map<road, float> connected_weights <- connected_roads as_map (each::each.shape.perimeter);
-                    simplified_road_network <- as_edge_graph(connected_roads) with_weights connected_weights;
-                    write "New graph has " + length(simplified_road_network.vertices) + " vertices";
+                    map<road, float> road_weights <- connected_roads as_map (each::each.shape.perimeter);
+                    simplified_road_network <- as_edge_graph(connected_roads) with_weights road_weights;
+                    write "Final graph has " + length(simplified_road_network.vertices) + " vertices and " + 
+                         length(simplified_road_network.edges) + " edges";
+                } else {
+                    write "ERROR: No roads in major components, using all roads as fallback";
+                    road_network <- as_edge_graph(road);
+                    map<road, float> road_weights <- road as_map (each::each.shape.perimeter);
+                    simplified_road_network <- as_edge_graph(road) with_weights road_weights;
                 }
             } else {
-                write "WARNING: No large components found, using all roads";
+                write "WARNING: No large components found (all components < " + min_component_size + " nodes), using all roads";
+                // Create final graph with all roads
+                road_network <- as_edge_graph(road);
+                map<road, float> road_weights <- road as_map (each::each.shape.perimeter);
+                simplified_road_network <- as_edge_graph(road) with_weights road_weights;
             }
         }
+        
+        // IMPORTANT: Final connectivity check
+        write "Final network stats:";
+        write "  Total roads: " + length(road);
+        write "  Graph vertices: " + length(simplified_road_network.vertices);
+        write "  Graph edges: " + length(simplified_road_network.edges);
         
         // Define land area (union of buildings and roads)
         land_area <- union(building collect each.shape, road collect each.shape);
@@ -1839,6 +1859,8 @@ experiment tsunami_simulation type: gui {
     parameter "Tsunami segments" var: tsunami_nb_segments min: 1 max: 50;
     parameter "Tsunami approach time" var: tsunami_approach_time min: 0 max: 1000;
     parameter "Average tsunami speed" var: tsunami_speed_avg min: 10.0 max: 100.0;
+    parameter "Show Network Vertices" var: show_network_vertices category: "Visualization";
+    parameter "Vertex Display Size" var: vertex_display_size category: "Visualization" min: 1.0 max: 20.0;
     
     output {
         display main_display type: opengl axes: false {
@@ -1942,6 +1964,16 @@ experiment tsunami_simulation type: gui {
 //                draw "Rescuers: " + length(people where (each.type = "rescuer")) at: {x, y - 70} color: #black;
 //                draw "Cars: " + length(car) at: {x, y - 90} color: #black;
 //                draw "Boats: " + length(boat) at: {x, y - 110} color: #black;
+            }
+            
+            // Display network vertices after clean_network
+            graphics "network_vertices" {
+                if (show_network_vertices and !empty(network_vertices)) {
+                    loop vertex over: network_vertices {
+                        // Draw vertex as a red circle (size adjustable via parameter)
+                        draw circle(vertex_display_size) at: vertex color: #red border: #darkred;
+                    }
+                }
             }
         }
         
