@@ -31,7 +31,7 @@ global {
     // GIS and data files
     file building_shapefile <- file("../includes/buildings.shp");
     file road_shapefile <- file("../includes/roads.shp");
-    file shelter_csvfile <- csv_file("../includes/shelters.csv", ",");
+    file shelter_csvfile <- csv_file("../includes/shelters_additional.csv", ",");
     
     // Image files for species
     file car_icon <- file("../includes/car-2897.png");
